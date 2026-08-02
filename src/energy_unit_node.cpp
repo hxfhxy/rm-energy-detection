@@ -1,35 +1,22 @@
 /**
  * @file energy_unit_node.cpp
- * @brief 能量单元位姿识别 ROS2 节点（支持多目标解析）
+ * @brief 能量单元极速解算节点 (无 TF、无 RViz、纯终端与 OpenCV 输出)
  */
 
-#include <algorithm>
 #include <chrono>
-#include <cstdint>
 #include <deque>
-#include <filesystem>
-#include <fstream>
-#include <limits>
-#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <vector>
 
-#include <opencv2/highgui.hpp>
+#include <opencv2/opencv.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
-#include <sensor_msgs/msg/camera_info.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
-#include <std_msgs/msg/header.hpp>
 #include <cv_bridge/cv_bridge.h>
-#include <tf2_ros/transform_broadcaster.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include "energy_unit_detector.h"
 #include "pose_estimator.h"
-#include "arm_transform.h"
 
 using namespace std::chrono_literals;
 
@@ -45,23 +32,17 @@ struct StampedDepthFrame {
     cv::Mat image;
 };
 
-static std::int64_t StampToNanoseconds(
-    const builtin_interfaces::msg::Time &stamp) {
-    return static_cast<std::int64_t>(stamp.sec) * 1000000000LL +
-           static_cast<std::int64_t>(stamp.nanosec);
+static std::int64_t StampToNanoseconds(const builtin_interfaces::msg::Time &stamp) {
+    return static_cast<std::int64_t>(stamp.sec) * 1000000000LL + static_cast<std::int64_t>(stamp.nanosec);
 }
 
 template <typename Frame>
 static std::optional<Frame> FindNearestFrame(
-    const std::deque<Frame> &frames,
-    std::int64_t target_ns,
-    std::int64_t tolerance_ns) {
+    const std::deque<Frame> &frames, std::int64_t target_ns, std::int64_t tolerance_ns) {
     std::optional<Frame> best_frame;
     std::int64_t best_delta = std::numeric_limits<std::int64_t>::max();
     for (const auto &frame : frames) {
-        const auto delta = frame.stamp_ns > target_ns
-                               ? frame.stamp_ns - target_ns
-                               : target_ns - frame.stamp_ns;
+        const auto delta = frame.stamp_ns > target_ns ? frame.stamp_ns - target_ns : target_ns - frame.stamp_ns;
         if (delta < best_delta) {
             best_delta = delta;
             best_frame = frame;
@@ -79,154 +60,65 @@ static void PruneHistory(std::deque<Frame> *frames, std::size_t max_size) {
 class EnergyUnitNode : public rclcpp::Node {
 public:
     EnergyUnitNode() : Node("energy_unit_node") {
-        this->declare_parameter("model_path", std::string("model/yolo/best.onnx"));
-        this->declare_parameter("conf_threshold", 0.6);
-        this->declare_parameter("nms_threshold", 0.45);
-        this->declare_parameter("input_size", 640);
-        this->declare_parameter("min_area", 2000.0);
-        this->declare_parameter("max_area", 400000.0);
-        this->declare_parameter("cylinder_radius", 0.04);
-        this->declare_parameter("cylinder_height", 0.12);
-        this->declare_parameter("hand_eye_roll", 0.0);
-        this->declare_parameter("hand_eye_pitch", 0.0);
-        this->declare_parameter("hand_eye_yaw", 0.0);
-        this->declare_parameter("hand_eye_tx", 0.0);
-        this->declare_parameter("hand_eye_ty", 0.0);
-        this->declare_parameter("hand_eye_tz", 0.0);
-        this->declare_parameter("result_dir", std::string("result"));
-        this->declare_parameter("save_interval", 5);
-        this->declare_parameter("frame_history_size", 100);
-        this->declare_parameter("sync_tolerance_ms", 50.0);
+        this->declare_parameter("sync_tolerance_ms", 10.0); // 严格同步，防止掉帧
+        sync_tolerance_ns_ = static_cast<std::int64_t>(this->get_parameter("sync_tolerance_ms").as_double() * 1000000.0);
 
-        const auto history_size = std::max<long>(
-            1, this->get_parameter("frame_history_size").as_int());
-        max_history_size_ = static_cast<std::size_t>(history_size);
-        const auto tolerance_ms =
-            this->get_parameter("sync_tolerance_ms").as_double();
-        sync_tolerance_ns_ = static_cast<std::int64_t>(tolerance_ms * 1000000.0);
-
+        // 1. 初始化 YOLO-Seg 检测器 (把你的模型绝对路径直接写死)
         DetectorConfig det_cfg;
-        det_cfg.model_path = this->get_parameter("model_path").as_string();
-        det_cfg.conf_threshold = static_cast<float>(this->get_parameter("conf_threshold").as_double());
-        det_cfg.nms_threshold = static_cast<float>(this->get_parameter("nms_threshold").as_double());
-        det_cfg.input_size = static_cast<int>(this->get_parameter("input_size").as_int());
-        det_cfg.min_area = this->get_parameter("min_area").as_double();
-        det_cfg.max_area = this->get_parameter("max_area").as_double();
+        det_cfg.model_path = "/home/hzy/能量单元位姿识别/model/yolo/best.onnx"; // ⚠️ 请确保这是你真实的绝对路径
         detector_ = std::make_unique<EnergyUnitDetector>(det_cfg);
 
+        // 2. 直接硬编码【深度相机】内参 (用于从深度图生成 3D 点云)
         EstimatorConfig est_cfg;
-        est_cfg.cylinder_radius = this->get_parameter("cylinder_radius").as_double();
-        est_cfg.cylinder_height = this->get_parameter("cylinder_height").as_double();
+        est_cfg.fx = 424.49407958984375; 
+        est_cfg.fy = 424.49407958984375;
+        est_cfg.cx = 422.3330383300781;
+        est_cfg.cy = 241.14089965820312;
+        est_cfg.cylinder_radius = 0.0475; // 95mm 的一半
+        est_cfg.cylinder_height = 0.150;  // 整体高度 150mm 
+        
+        RCLCPP_INFO(this->get_logger(), "已硬编码深度相机内参: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f", 
+                    est_cfg.fx, est_cfg.fy, est_cfg.cx, est_cfg.cy);
+
         estimator_ = std::make_unique<PoseEstimator>(est_cfg);
 
-        std::string model_dir = det_cfg.model_path.substr(0, det_cfg.model_path.find_last_of('/'));
-        std::string model_root = model_dir;
-        size_t last_slash = model_dir.find_last_of('/');
-        if (last_slash != std::string::npos) model_root = model_dir.substr(0, last_slash);
-
-        m3t_dir_ = "/home/hzy/能量单元位姿识别/model/m3t";
-        obj_path_ = model_root + "/obj/Str3D.obj";
-
-        Transform T_ee_cam = ArmTransform::fromEuler(
-            this->get_parameter("hand_eye_roll").as_double(),
-            this->get_parameter("hand_eye_pitch").as_double(),
-            this->get_parameter("hand_eye_yaw").as_double(),
-            this->get_parameter("hand_eye_tx").as_double(),
-            this->get_parameter("hand_eye_ty").as_double(),
-            this->get_parameter("hand_eye_tz").as_double());
-        arm_transform_ = std::make_unique<ArmTransform>(Transform(), T_ee_cam);
-        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-
-        color_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-            "/camera/camera/color/image_raw", rclcpp::SensorDataQoS(),
-            [this](const sensor_msgs::msg::Image::SharedPtr msg) { SetColorImage(msg); });
+        // 3. 订阅 rosbag 话题
         color_compressed_sub_ = this->create_subscription<sensor_msgs::msg::CompressedImage>(
             "/camera/camera/color/image_raw/compressed", rclcpp::SensorDataQoS(),
             [this](const sensor_msgs::msg::CompressedImage::SharedPtr msg) { SetColorImageCompressed(msg); });
+            
         depth_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
             "/camera/camera/depth/image_rect_raw", rclcpp::SensorDataQoS(),
             [this](const sensor_msgs::msg::Image::SharedPtr msg) { SetDepthImage(msg); });
-        camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-            "/camera/camera/color/camera_info", rclcpp::SensorDataQoS(),
-            [this](const sensor_msgs::msg::CameraInfo::SharedPtr msg) { SetCameraInfo(msg); });
 
-        result_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>("/energy_unit/result_image", 10);
-        pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/energy_unit/pose", 10);
-        arm_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/energy_unit/arm_pose", 10);
-
-        result_dir_ = this->get_parameter("result_dir").as_string();
-        save_interval_ = static_cast<int>(this->get_parameter("save_interval").as_int());
-        std::filesystem::create_directories(result_dir_);
-        std::filesystem::create_directories(result_dir_ + "/images");
-        frame_count_ = 0;
-
-        pose_csv_.open(result_dir_ + "/poses.csv");
-        pose_csv_ << "frame,timestamp_ns,target_idx,tx,ty,tz,qw,qx,qy,qz,"
-                  << "roll_deg,pitch_deg,yaw_deg,"
-                  << "detect_ms,total_ms,num_objects\n";
-
-        RCLCPP_INFO(this->get_logger(), "多目标能量单元位姿识别节点已启动");
+        RCLCPP_INFO(this->get_logger(), "== 等待 rosbag play ==");
     }
 
 private:
     std::unique_ptr<EnergyUnitDetector> detector_;
     std::unique_ptr<PoseEstimator> estimator_;
-    std::unique_ptr<ArmTransform> arm_transform_;
-    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
-    std::string result_dir_;
-    int save_interval_;
-    int frame_count_;
-    std::ofstream pose_csv_;
-
-    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr color_sub_;
     rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr color_compressed_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;
-    rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_sub_;
-    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr result_image_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr arm_pose_pub_;
 
     mutable std::mutex mutex_;
     std::deque<StampedColorFrame> color_history_;
     std::deque<StampedDepthFrame> depth_history_;
-    std::size_t max_history_size_{100};
-    std::int64_t sync_tolerance_ns_{50000000};
-    bool camera_info_received_ = false;
-
-    std::string obj_path_;
-    std::string m3t_dir_;
-
-    void SetColorImage(const sensor_msgs::msg::Image::SharedPtr &msg) {
-        cv::Mat image;
-        try {
-            image = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8)->image;
-        } catch (const cv_bridge::Exception &e) {
-            RCLCPP_ERROR(this->get_logger(), "彩色图转换失败: %s", e.what());
-            return;
-        }
-        const auto stamp_ns = StampToNanoseconds(msg->header.stamp);
-        {
-            const std::lock_guard<std::mutex> lock{mutex_};
-            color_history_.push_back({stamp_ns, image.clone()});
-            PruneHistory(&color_history_, max_history_size_);
-        }
-        TryProcessFrame(stamp_ns);
-    }
+    std::int64_t sync_tolerance_ns_;
+    std::int64_t last_processed_stamp_ns_ = 0;
 
     void SetColorImageCompressed(const sensor_msgs::msg::CompressedImage::SharedPtr &msg) {
         cv::Mat image;
         try {
-            cv::Mat buf(1, static_cast<int>(msg->data.size()), CV_8UC1,
-                        const_cast<uint8_t *>(msg->data.data()));
-            image = cv::imdecode(buf, cv::IMREAD_COLOR);
+            image = cv::imdecode(cv::Mat(1, msg->data.size(), CV_8UC1, (void*)msg->data.data()), cv::IMREAD_COLOR);
             if (image.empty()) return;
         } catch (...) { return; }
-        const auto stamp_ns = StampToNanoseconds(msg->header.stamp);
+        
+        auto stamp_ns = StampToNanoseconds(msg->header.stamp);
         {
             const std::lock_guard<std::mutex> lock{mutex_};
-            color_history_.push_back({stamp_ns, image.clone()});
-            PruneHistory(&color_history_, max_history_size_);
+            color_history_.push_back({stamp_ns, image}); 
+            PruneHistory(&color_history_, 30);
         }
         TryProcessFrame(stamp_ns);
     }
@@ -234,36 +126,28 @@ private:
     void SetDepthImage(const sensor_msgs::msg::Image::SharedPtr &msg) {
         cv::Mat image;
         try {
+            // 使用 toCvShare 浅拷贝代替 toCvCopy 深拷贝，提升性能
             if (msg->encoding == "16UC1") {
-                image = cv_bridge::toCvCopy(msg, "16UC1")->image;
+                image = cv_bridge::toCvShare(msg, "16UC1")->image;
             } else if (msg->encoding == "32FC1") {
-                cv::Mat f = cv_bridge::toCvCopy(msg, "32FC1")->image;
+                cv::Mat f = cv_bridge::toCvShare(msg, "32FC1")->image;
                 f.convertTo(image, CV_16UC1, 1000.0);
             } else {
-                image = cv_bridge::toCvCopy(msg, msg->encoding)->image;
+                image = cv_bridge::toCvShare(msg, msg->encoding)->image;
             }
         } catch (const cv_bridge::Exception &e) {
             RCLCPP_ERROR(this->get_logger(), "深度图转换失败: %s", e.what());
             return;
         }
         if (image.empty()) return;
-        const auto stamp_ns = StampToNanoseconds(msg->header.stamp);
+        
+        auto stamp_ns = StampToNanoseconds(msg->header.stamp);
         {
             const std::lock_guard<std::mutex> lock{mutex_};
-            depth_history_.push_back({stamp_ns, image.clone()});
-            PruneHistory(&depth_history_, max_history_size_);
+            depth_history_.push_back({stamp_ns, image.clone()}); 
+            PruneHistory(&depth_history_, 30);
         }
         TryProcessFrame(stamp_ns);
-    }
-
-    void SetCameraInfo(const sensor_msgs::msg::CameraInfo::SharedPtr &msg) {
-        if (!camera_info_received_) {
-            estimator_->updateIntrinsics(msg->k[0], msg->k[4], msg->k[2], msg->k[5]);
-            if (estimator_->loadModel(obj_path_, m3t_dir_)) {
-                RCLCPP_INFO(this->get_logger(), "多目标 M3T 模型装载成功！");
-            }
-            camera_info_received_ = true;
-        }
     }
 
     void TryProcessFrame(std::int64_t trigger_stamp_ns) {
@@ -277,106 +161,133 @@ private:
         }
         if (!color || !depth) return;
 
-        std_msgs::msg::Header header;
-        header.stamp.sec = static_cast<int32_t>(color->stamp_ns / 1000000000LL);
-        header.stamp.nanosec = static_cast<uint32_t>(color->stamp_ns % 1000000000LL);
-        header.frame_id = "camera_color_optical_frame";
+        // 彻底解决双重触发导致卡顿的问题
+        if (color->stamp_ns == last_processed_stamp_ns_) return; 
+        last_processed_stamp_ns_ = color->stamp_ns;
 
-        processFrame(color->image, depth->image, header);
+        processFrame(color->image, depth->image);
+    }
+    
+    cv::Mat reprojectDepthToRGB(const cv::Mat& depth_16u,        // 深度图 (mm)
+                                const cv::Mat& color_8u3,        // 原始彩色图
+                                const Eigen::Matrix3d& K_depth,
+                                const Eigen::Matrix3d& K_rgb,
+                                const Eigen::Matrix3d& R_d2c = Eigen::Matrix3d::Identity(),
+                                const Eigen::Vector3d& t_d2c = Eigen::Vector3d::Zero()) {
+        cv::Mat uv_rgb(depth_16u.rows, depth_16u.cols, CV_8UC3, cv::Scalar(0,0,0));
+
+        // 预计算深度内参逆矩阵
+        double inv_fx_d = 1.0 / K_depth(0,0);
+        double inv_fy_d = 1.0 / K_depth(1,1);
+        double cx_d = K_depth(0,2);
+        double cy_d = K_depth(1,2);
+
+        // 彩色内参
+        double fx_rgb = K_rgb(0,0);
+        double fy_rgb = K_rgb(1,1);
+        double cx_rgb = K_rgb(0,2);
+        double cy_rgb = K_rgb(1,2);
+
+        for (int vd = 0; vd < depth_16u.rows; ++vd) {
+            const uint16_t* drow = depth_16u.ptr<uint16_t>(vd);
+            cv::Vec3b* urrow = uv_rgb.ptr<cv::Vec3b>(vd);
+            for (int ud = 0; ud < depth_16u.cols; ++ud) {
+                uint16_t d_mm = drow[ud];
+                if (d_mm < 100 || d_mm > 5000) continue;   // 无效深度
+
+                // 1. 反投影到深度相机坐标系
+                double z = d_mm / 1000.0;
+                double x = (ud - cx_d) * z * inv_fx_d;
+                double y = (vd - cy_d) * z * inv_fy_d;
+                Eigen::Vector3d P_d(x, y, z);
+
+                // 2. 转换到彩色相机坐标系 (假设 R=I, t=0)
+                Eigen::Vector3d P_c = R_d2c * P_d + t_d2c;
+
+                // 3. 投影到彩色图像平面
+                double uc = (P_c.x() * fx_rgb / P_c.z()) + cx_rgb;
+                double vc = (P_c.y() * fy_rgb / P_c.z()) + cy_rgb;
+                int iuc = std::lround(uc);
+                int ivc = std::lround(vc);
+
+                // 4. 采样彩色图
+                if (iuc >= 0 && iuc < color_8u3.cols && ivc >= 0 && ivc < color_8u3.rows) {
+                    urrow[ud] = color_8u3.at<cv::Vec3b>(ivc, iuc);
+                }
+            }
+        }
+        return uv_rgb;
     }
 
-    void processFrame(const cv::Mat &color, const cv::Mat &depth,
-                      const std_msgs::msg::Header &header) {
+    void processFrame(const cv::Mat& color, const cv::Mat& depth) {
+        // ---------- 生成 uv-rgb 图像 (与深度图对齐) ----------
+        static const Eigen::Matrix3d K_depth(
+            (Eigen::Matrix3d() << 424.49407958984375, 0.0, 422.3330383300781,
+                                0.0, 424.49407958984375, 241.14089965820312,
+                                0.0, 0.0, 1.0).finished());
+        static const Eigen::Matrix3d K_rgb(
+            (Eigen::Matrix3d() << 920.73095703125, 0.0, 646.6663818359375,
+                                0.0, 921.03125, 346.5528564453125,
+                                0.0, 0.0, 1.0).finished());
+
+        cv::Mat uv_rgb = reprojectDepthToRGB(depth, color, K_depth, K_rgb);
+        // 如果以后获取了外参，可改为：
+        // cv::Mat uv_rgb = reprojectDepthToRGB(depth, color, K_depth, K_rgb, R_d2c, t_d2c);
+
+        // ---------- 检测与姿态估计 ----------
         auto t_start = std::chrono::high_resolution_clock::now();
 
-        // 1. YOLO 检测
-        auto detections = detector_->detect(color, depth);
-        auto t_detect = std::chrono::high_resolution_clock::now();
-
-        cv::Mat display = color.clone();
-        detector_->drawDetections(display, detections);
-
-        // 🔥 2. 多目标 M3T 求解主接口
-        auto valid_poses = estimator_->estimateMulti(detections, depth, color);
-
-        // 3. 遍历并发布所有目标
-        for (size_t i = 0; i < valid_poses.size(); ++i) {
-            const auto& pose = valid_poses[i];
-
-            estimator_->drawPoseAxes(display, pose);
-            publishPose(pose, header, i);
-
-            Transform T_cam_obj = ArmTransform::fromMatrix(pose.T_cam_obj);
-            Transform T_ee_obj = arm_transform_->computeEEToObject(T_cam_obj);
-            publishArmPose(T_ee_obj, header);
-            broadcastTF(pose, header, i); // 广播: energy_unit_0, energy_unit_1, energy_unit_2
-        }
+        // 用 uv_rgb 进行检测（尺寸与 depth 一致，掩码直接适配深度图像素）
+        auto detections = detector_->detect(uv_rgb, depth);
+        auto valid_poses = estimator_->estimateMulti(detections, depth, uv_rgb);
 
         auto t_end = std::chrono::high_resolution_clock::now();
-        double detect_ms = std::chrono::duration<double, std::milli>(t_detect - t_start).count();
         double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        double current_fps = 1000.0 / total_ms;
 
-        char info[256];
-        snprintf(info, sizeof(info),
-                 "Det: %.1fms | Total: %.1fms | YOLO: %zu | Tracked: %zu",
-                 detect_ms, total_ms, detections.size(), valid_poses.size());
-        cv::putText(display, info, cv::Point(10, 30),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
+        // ---------- 可视化 ----------
+        cv::Mat display = uv_rgb.clone();
+        detector_->drawDetections(display, detections);
 
-        result_image_pub_->publish(*cv_bridge::CvImage(header, "bgr8", display).toImageMsg());
+        // OSD 文字
+        char osd_text[128];
+        snprintf(osd_text, sizeof(osd_text), "FPS: %5.1f | Time: %5.1f ms", current_fps, total_ms);
+        int baseLine = 0;
+        cv::Size textSize = cv::getTextSize(osd_text, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseLine);
+        cv::Point textOrg(15, 30);
+        cv::Rect textBg(textOrg.x - 5, textOrg.y - textSize.height - 5, textSize.width + 10, textSize.height + 10);
+        cv::rectangle(display, textBg, cv::Scalar(0, 0, 0), -1);
+        cv::putText(display, osd_text, textOrg, cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
 
-        cv::imshow("Energy Unit", display);
+        printf("\r[FPS: %5.1f] 耗时: %5.1f ms | 目标数: %zu ", current_fps, total_ms, valid_poses.size());
+        fflush(stdout);
+
+        for (size_t i = 0; i < valid_poses.size(); ++i) {
+            estimator_->drawPoseAxes(display, valid_poses[i]);
+            printf("\n  [Target %zu] 坐标(XYZ): %.3f, %.3f, %.3f | 姿态(RPY): %.1f, %.1f, %.1f",
+                i,
+                valid_poses[i].translation.x(), valid_poses[i].translation.y(), valid_poses[i].translation.z(),
+                valid_poses[i].euler_angles.x(), valid_poses[i].euler_angles.y(), valid_poses[i].euler_angles.z());
+        }
+
+        // 深度图可视化
+        cv::Mat depth_display;
+        depth.convertTo(depth_display, CV_8UC1, 255.0 / 4000.0);
+        cv::imshow("Depth Stream", depth_display);
+
+        // 显示主要窗口 (uv_rgb + 检测 + 坐标轴)
+        cv::imshow("Energy Unit RANSAC Tracker", display);
+
+        // 对齐检查窗口：uv_rgb 与深度图叠加（尺寸相同）
+        cv::Mat alignment_check;
+        cv::cvtColor(depth_display, depth_display, cv::COLOR_GRAY2BGR); // 转为3通道以便叠加
+        cv::addWeighted(display, 0.5, depth_display, 0.5, 0, alignment_check);
+        cv::imshow("Alignment Check (UV-RGB + Depth)", alignment_check);
+
         cv::waitKey(1);
-
-        frame_count_++;
-        if (frame_count_ % save_interval_ == 0) {
-            char p[512];
-            snprintf(p, sizeof(p), "%s/images/frame_%06d.jpg", result_dir_.c_str(), frame_count_);
-            cv::imwrite(p, display);
-        }
-
-        if (!valid_poses.empty()) {
-            uint64_t stamp_ns = header.stamp.sec * 1000000000ULL + header.stamp.nanosec;
-            for (size_t i = 0; i < valid_poses.size(); ++i) {
-                const auto &p = valid_poses[i];
-                pose_csv_ << frame_count_ << "," << stamp_ns << "," << i << ","
-                          << p.translation.x() << "," << p.translation.y() << "," << p.translation.z() << ","
-                          << p.quaternion.w() << "," << p.quaternion.x() << "," << p.quaternion.y() << "," << p.quaternion.z() << ","
-                          << p.euler_angles.x() << "," << p.euler_angles.y() << "," << p.euler_angles.z() << ","
-                          << detect_ms << "," << total_ms << "," << detections.size() << "\n";
-            }
-            pose_csv_.flush();
-        }
-    }
-
-    void publishPose(const PoseResult &p, const std_msgs::msg::Header &h, size_t i) {
-        auto m = std::make_shared<geometry_msgs::msg::PoseStamped>();
-        m->header = h; m->header.frame_id = "camera_link";
-        m->pose.position.x = p.translation.x(); m->pose.position.y = p.translation.y(); m->pose.position.z = p.translation.z();
-        m->pose.orientation.w = p.quaternion.w(); m->pose.orientation.x = p.quaternion.x();
-        m->pose.orientation.y = p.quaternion.y(); m->pose.orientation.z = p.quaternion.z();
-        if (i == 0) pose_pub_->publish(*m);
-    }
-
-    void publishArmPose(const Transform &T, const std_msgs::msg::Header &h) {
-        auto m = std::make_shared<geometry_msgs::msg::PoseStamped>();
-        m->header = h; m->header.frame_id = "arm_end_effector";
-        m->pose.position.x = T.translation.x(); m->pose.position.y = T.translation.y(); m->pose.position.z = T.translation.z();
-        m->pose.orientation.w = T.rotation.w(); m->pose.orientation.x = T.rotation.x();
-        m->pose.orientation.y = T.rotation.y(); m->pose.orientation.z = T.rotation.z();
-        arm_pose_pub_->publish(*m);
-    }
-
-    void broadcastTF(const PoseResult &p, const std_msgs::msg::Header &h, size_t i) {
-        geometry_msgs::msg::TransformStamped t;
-        t.header = h; t.header.frame_id = "camera_link";
-        t.child_frame_id = "energy_unit_" + std::to_string(i);
-        t.transform.translation.x = p.translation.x(); t.transform.translation.y = p.translation.y(); t.transform.translation.z = p.translation.z();
-        t.transform.rotation.w = p.quaternion.w(); t.transform.rotation.x = p.quaternion.x();
-        t.transform.rotation.y = p.quaternion.y(); t.transform.rotation.z = p.quaternion.z();
-        tf_broadcaster_->sendTransform(t);
     }
 };
+
 
 }  // namespace energy_unit
 

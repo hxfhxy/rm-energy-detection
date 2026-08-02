@@ -1,290 +1,564 @@
 #include "pose_estimator.h"
-#include <random>
-#include <cmath>
+#include "energy_unit_detector.h"
 #include <iostream>
-#include <Eigen/Eigenvalues>
+#include <numeric>
+#include <random>
+#include <unordered_set>
 
 namespace energy_unit {
 
-PoseEstimator::PoseEstimator(const EstimatorConfig& config)
-    : config_(config) {
-    camera_matrix_ = (cv::Mat_<double>(3, 3) <<
-        config_.fx, 0, config_.cx,
-        0, config_.fy, config_.cy,
-        0, 0, 1);
+// ==================== 辅助工具函数 ====================
+namespace {
+    // 简单k-d树节点（用于最近邻搜索，点数不多时暴力亦可，但为效率实现基本k-d树）
+    struct SimpleKDNode {
+        Eigen::Vector3d pt;
+        int axis;
+        SimpleKDNode* left = nullptr;
+        SimpleKDNode* right = nullptr;
+    };
+
+    SimpleKDNode* buildKDTree(std::vector<Eigen::Vector3d> pts, int depth = 0) {
+        if (pts.empty()) return nullptr;
+        int axis = depth % 3;
+        size_t mid = pts.size() / 2;
+        std::nth_element(pts.begin(), pts.begin() + mid, pts.end(),
+            [axis](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
+                return a[axis] < b[axis];
+            });
+        SimpleKDNode* node = new SimpleKDNode{pts[mid], axis, nullptr, nullptr};
+        node->left = buildKDTree({pts.begin(), pts.begin() + mid}, depth + 1);
+        node->right = buildKDTree({pts.begin() + mid + 1, pts.end()}, depth + 1);
+        return node;
+    }
+
+    void deleteKDTree(SimpleKDNode* node) {
+        if (!node) return;
+        deleteKDTree(node->left);
+        deleteKDTree(node->right);
+        delete node;
+    }
+
+    void nearestNeighbor(SimpleKDNode* node, const Eigen::Vector3d& query,
+                         double& best_dist, Eigen::Vector3d& best_pt) {
+        if (!node) return;
+        double d = (node->pt - query).norm();
+        if (d < best_dist) {
+            best_dist = d;
+            best_pt = node->pt;
+        }
+        int axis = node->axis;
+        double diff = query[axis] - node->pt[axis];
+        SimpleKDNode* first = diff <= 0 ? node->left : node->right;
+        SimpleKDNode* second = diff <= 0 ? node->right : node->left;
+        nearestNeighbor(first, query, best_dist, best_pt);
+        if (std::abs(diff) < best_dist) {
+            nearestNeighbor(second, query, best_dist, best_pt);
+        }
+    }
+
+    // 欧式聚类（使用简单的区域生长 + 空间网格）
+    std::vector<std::vector<Eigen::Vector3d>> euclideanCluster(
+        const std::vector<Eigen::Vector3d>& pts, double tolerance, int min_size) {
+        // 构建空间网格加速邻域查询
+        auto [min_x, max_x] = std::minmax_element(pts.begin(), pts.end(),
+            [](const auto& a, const auto& b) { return a.x() < b.x(); });
+        auto [min_y, max_y] = std::minmax_element(pts.begin(), pts.end(),
+            [](const auto& a, const auto& b) { return a.y() < b.y(); });
+        double grid_size = tolerance;
+        int nx = std::max(1, (int)((max_x->x() - min_x->x()) / grid_size) + 1);
+        int ny = std::max(1, (int)((max_y->y() - min_y->y()) / grid_size) + 1);
+        std::vector<std::vector<int>> grid(nx * ny);
+        for (size_t i = 0; i < pts.size(); ++i) {
+            int gx = (int)((pts[i].x() - min_x->x()) / grid_size);
+            int gy = (int)((pts[i].y() - min_y->y()) / grid_size);
+            gx = std::clamp(gx, 0, nx - 1);
+            gy = std::clamp(gy, 0, ny - 1);
+            grid[gy * nx + gx].push_back((int)i);
+        }
+
+        std::vector<bool> visited(pts.size(), false);
+        std::vector<std::vector<Eigen::Vector3d>> clusters;
+        for (size_t i = 0; i < pts.size(); ++i) {
+            if (visited[i]) continue;
+            std::vector<Eigen::Vector3d> cluster;
+            std::vector<int> stack = {(int)i};
+            visited[i] = true;
+            while (!stack.empty()) {
+                int idx = stack.back();
+                stack.pop_back();
+                cluster.push_back(pts[idx]);
+                int gx = (int)((pts[idx].x() - min_x->x()) / grid_size);
+                int gy = (int)((pts[idx].y() - min_y->y()) / grid_size);
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        int nxg = gx + dx, nyg = gy + dy;
+                        if (nxg < 0 || nxg >= nx || nyg < 0 || nyg >= ny) continue;
+                        for (int nbr : grid[nyg * nx + nxg]) {
+                            if (visited[nbr]) continue;
+                            if ((pts[idx] - pts[nbr]).norm() <= tolerance) {
+                                visited[nbr] = true;
+                                stack.push_back(nbr);
+                            }
+                        }
+                    }
+                }
+            }
+            if ((int)cluster.size() >= min_size)
+                clusters.push_back(cluster);
+        }
+        return clusters;
+    }
+}
+
+// ==================== PoseEstimator 实现 ====================
+PoseEstimator::PoseEstimator(const EstimatorConfig& config) : config_(config) {
+    camera_matrix_ = (cv::Mat_<double>(3, 3) << config_.fx, 0, config_.cx, 0, config_.fy, config_.cy, 0, 0, 1);
     dist_coeffs_ = cv::Mat::zeros(1, 5, CV_64F);
+    buildModelCloud();  // 生成模型点云
 }
 
 void PoseEstimator::updateIntrinsics(double fx, double fy, double cx, double cy) {
-    config_.fx = fx; config_.fy = fy;
-    config_.cx = cx; config_.cy = cy;
+    config_.fx = fx; config_.fy = fy; config_.cx = cx; config_.cy = cy;
     camera_matrix_ = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
 }
 
-bool PoseEstimator::loadModel(const std::string& obj_path, const std::string& m3t_dir) {
-    (void)obj_path;
-    std::string body_yaml = m3t_dir + "/Str3D_body.yaml";
-
-    renderer_geometry_ = std::make_shared<m3t::RendererGeometry>("rg");
-    color_camera_ = std::make_shared<SimpleColorCamera>("color_cam");
-    depth_camera_ = std::make_shared<SimpleDepthCamera>("depth_cam");
-
-    m3t::Intrinsics intr;
-    intr.fu = static_cast<float>(config_.fx);
-    intr.fv = static_cast<float>(config_.fy);
-    intr.ppu = static_cast<float>(config_.cx);
-    intr.ppv = static_cast<float>(config_.cy);
-    intr.width = 640;
-    intr.height = 480;
-    color_camera_->set_intrinsics(intr);
-    depth_camera_->set_intrinsics(intr);
-    depth_camera_->set_depth_scale(0.001f);
-
-    tracker_ = std::make_shared<m3t::Tracker>("tracker");
-
-    // 🔥 预创建 MAX_TARGETS (3个) 独立的 M3T 实体槽位
-    slots_.clear();
-    for (int i = 0; i < MAX_TARGETS; ++i) {
-        ObjectSlot slot;
-        slot.id = i;
-        std::string name_suffix = "_" + std::to_string(i);
-
-        slot.body = std::make_shared<m3t::Body>("energy_unit" + name_suffix, std::filesystem::path(body_yaml));
-        renderer_geometry_->AddBody(slot.body); // 所有物体加入同一个渲染器以计算相互遮挡
-
-        auto region_model = std::make_shared<m3t::RegionModel>(
-            "region_model" + name_suffix, slot.body, std::filesystem::path(m3t_dir) / "Str3D_region.bin");
-        auto depth_model = std::make_shared<m3t::DepthModel>(
-            "depth_model" + name_suffix, slot.body, std::filesystem::path(m3t_dir) / "Str3D_depth.bin");
-
-        auto region_modality = std::make_shared<m3t::RegionModality>(
-            "region_modality" + name_suffix, slot.body, color_camera_, region_model);
-        auto depth_modality = std::make_shared<m3t::DepthModality>(
-            "depth_modality" + name_suffix, slot.body, depth_camera_, depth_model);
-
-        region_modality->MeasureOcclusions(depth_camera_);
-        depth_modality->MeasureOcclusions();
-
-        slot.link = std::make_shared<m3t::Link>("link" + name_suffix, slot.body);
-        slot.link->AddModality(region_modality);
-        slot.link->AddModality(depth_modality);
-
-        slot.optimizer = std::make_shared<m3t::Optimizer>("optimizer" + name_suffix, slot.link);
-        tracker_->AddOptimizer(slot.optimizer);
-
-        m3t::Transform3fA init_pose = m3t::Transform3fA::Identity();
-        init_pose.translation() = Eigen::Vector3f(0.0f, 0.0f, 10.0f); // 初始置于远处
-        slot.body->set_body2world_pose(init_pose);
-        slot.link->set_link2world_pose(init_pose);
-
-        slot.active = false;
-        slots_.push_back(slot);
+void PoseEstimator::buildModelCloud() {
+    double r = config_.cylinder_radius;
+    double h = config_.cylinder_height;
+    model_cloud_.clear();
+    // 生成圆柱体点云：侧面 + 顶底圆盘
+    int n_side = 200;    // 圆周采样
+    int n_h = 20;        // 高度采样
+    for (int i = 0; i < n_side; ++i) {
+        double angle = 2 * M_PI * i / n_side;
+        double x = r * cos(angle);
+        double y = r * sin(angle);
+        for (int j = 0; j <= n_h; ++j) {
+            double z = -h/2 + h * j / n_h;
+            model_cloud_.emplace_back(x, y, z);
+        }
     }
-
-    if (!tracker_->SetUp()) {
-        std::cerr << "[PoseEstimator] 多目标 M3T SetUp 失败" << std::endl;
-        return false;
+    // 顶底面
+    int n_disk = 100;
+    for (int i = 0; i < n_disk; ++i) {
+        double angle = 2 * M_PI * i / n_disk;
+        for (double rad : {r * 0.7, r * 0.85, r}) {
+            double x = rad * cos(angle);
+            double y = rad * sin(angle);
+            model_cloud_.emplace_back(x, y, -h/2);
+            model_cloud_.emplace_back(x, y, h/2);
+        }
     }
-
-    m3t_initialized_ = true;
-    std::cout << "[PoseEstimator] 多目标 M3T (3槽位) 初始化成功！" << std::endl;
-    return true;
+    // 可进一步添加内部特征点，但对称物体ICP主要靠侧面
 }
 
-std::vector<PoseResult> PoseEstimator::estimateMulti(
-    const std::vector<Detection>& detections,
-    const cv::Mat& depth,
-    const cv::Mat& color_bgr) {
-
-    std::vector<PoseResult> results;
-    if (!m3t_initialized_) return results;
-
-    // 1. 灌入最新图像
-    color_camera_->set_image(color_bgr);
-    depth_camera_->set_image(depth);
-
-    // 2. 预解析当前 YOLO 检测框的 PCA 位姿
-    struct DetInfo {
-        Detection det;
-        bool pca_valid = false;
-        m3t::Transform3fA pca_pose = m3t::Transform3fA::Identity();
-        Eigen::Vector3d center_3d = Eigen::Vector3d::Zero();
-        bool matched = false;
-    };
-
-    std::vector<DetInfo> det_infos;
-    for (const auto& det : detections) {
-        DetInfo info;
-        info.det = det;
-        info.pca_pose = computePCAPose(det, depth, info.pca_valid, info.center_3d);
-        det_infos.push_back(info);
-    }
-
-    // 3. 数据关联：匹配已激活槽位与当前 YOLO 检测
-    for (auto& slot : slots_) {
-        if (!slot.active) continue;
-
-        double min_dist = 0.3; // 3D 距离关联阈值 (0.3米)
-        int best_match_idx = -1;
-
-        for (size_t i = 0; i < det_infos.size(); ++i) {
-            if (det_infos[i].matched || !det_infos[i].pca_valid) continue;
-            double d = (slot.last_center - det_infos[i].center_3d).norm();
-            if (d < min_dist) {
-                min_dist = d;
-                best_match_idx = (int)i;
-            }
-        }
-
-        if (best_match_idx != -1) {
-            det_infos[best_match_idx].matched = true;
-            slot.loss_counter = 0;
-        } else {
-            slot.loss_counter++;
-            if (slot.loss_counter >= 5) { // 连续 5 帧未匹配到则注销槽位
-                resetTrackingSlot(slot.id);
-            }
-        }
-    }
-
-    // 4. 新目标激活：将未匹配的 YOLO 检测分配给空闲槽位
-    for (auto& info : det_infos) {
-        if (info.matched || !info.pca_valid) continue;
-
-        for (auto& slot : slots_) {
-            if (!slot.active) {
-                slot.body->set_body2world_pose(info.pca_pose);
-                slot.link->set_link2world_pose(info.pca_pose);
-                slot.last_center = info.center_3d;
-                slot.active = true;
-                slot.loss_counter = 0;
-                info.matched = true;
-                break;
-            }
-        }
-    }
-
-    // 5. 统一执行 M3T Step 求解
-    bool any_active = false;
-    for (const auto& slot : slots_) {
-        if (slot.active) { any_active = true; break; }
-    }
-
-    if (any_active) {
-        tracker_->ExecuteTrackingStep(0); // 内部并行/联合优化所有活跃槽位
-    }
-
-    // 6. 提取所有激活槽位的 6D 位姿结果
-    for (auto& slot : slots_) {
-        if (!slot.active) continue;
-
-        m3t::Transform3fA pose = slot.body->body2world_pose();
-        Eigen::Matrix3d R = pose.linear().cast<double>();
-        Eigen::Vector3d t = pose.translation().cast<double>();
-
-        // 防漂移异常值二次校验
-        if (t.z() < 0.1 || t.z() > 6.0 || std::isnan(t.x())) {
-            resetTrackingSlot(slot.id);
-            continue;
-        }
-
-        slot.last_center = t;
-
-        PoseResult res;
-        res.T_cam_obj = Eigen::Matrix4d::Identity();
-        res.T_cam_obj.block<3, 3>(0, 0) = R;
-        res.T_cam_obj.block<3, 1>(0, 3) = t;
-        res.translation = t;
-        res.quaternion = Eigen::Quaterniond(R);
-        res.quaternion.normalize();
-        res.axis_direction = R.col(2);
-        res.euler_angles = R.eulerAngles(2, 1, 0) * 180.0 / M_PI;
-        res.confidence = 1.0;
-        res.valid = true;
-
-        results.push_back(res);
-    }
-
-    return results;
-}
-
-m3t::Transform3fA PoseEstimator::computePCAPose(
-    const Detection& det, const cv::Mat& depth, bool& valid, Eigen::Vector3d& out_center) const {
-
-    valid = false;
-    m3t::Transform3fA pose = m3t::Transform3fA::Identity();
-
-    auto points_3d = extractPointCloud(det, depth);
-    if (points_3d.size() < 10) return pose;
-
-    Eigen::Vector3d centroid(0, 0, 0);
-    for (const auto& p : points_3d) centroid += Eigen::Vector3d(p.x, p.y, p.z);
-    centroid /= points_3d.size();
-    out_center = centroid;
-
-    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-    for (const auto& p : points_3d) {
-        Eigen::Vector3d diff = Eigen::Vector3d(p.x, p.y, p.z) - centroid;
-        cov += diff * diff.transpose();
-    }
-    cov /= points_3d.size();
-
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(cov);
-    if (solver.info() != Eigen::Success) return pose;
-
-    Eigen::Vector3d z_axis = solver.eigenvectors().col(2).normalized();
-    if (z_axis.y() < 0) z_axis = -z_axis;
-
-    Eigen::Vector3d cam_x(1.0, 0.0, 0.0);
-    Eigen::Vector3d x_proj = cam_x - cam_x.dot(z_axis) * z_axis;
-    if (x_proj.norm() < 1e-4) {
-        x_proj = Eigen::Vector3d(0.0, 1.0, 0.0).cross(z_axis);
-    }
-    Eigen::Vector3d x_axis = x_proj.normalized();
-    Eigen::Vector3d y_axis = z_axis.cross(x_axis).normalized();
-    x_axis = y_axis.cross(z_axis).normalized();
-
-    pose.linear() << x_axis.cast<float>(), y_axis.cast<float>(), z_axis.cast<float>();
-    pose.translation() = centroid.cast<float>();
-
-    if (centroid.z() > 0.2 && centroid.z() < 5.0) {
-        valid = true;
-    }
-    return pose;
-}
-
-std::vector<cv::Point3f> PoseEstimator::extractPointCloud(const Detection& det, const cv::Mat& depth) const {
-    std::vector<cv::Point3f> points;
+std::vector<Eigen::Vector3d> PoseEstimator::extractPointCloud(const Detection& det, const cv::Mat& depth) const {
+    std::vector<Eigen::Vector3d> points;
     cv::Rect roi = det.bbox_axis_aligned & cv::Rect(0, 0, depth.cols, depth.rows);
     if (roi.width <= 0 || roi.height <= 0) return points;
 
-    int area = roi.width * roi.height;
-    int step = (area > 40000) ? 3 : (area > 10000 ? 2 : 1);
-    points.reserve(area / (step * step));
-
     const bool has_mask = !det.mask.empty();
-    for (int y = roi.y; y < roi.y + roi.height; y += step) {
-        for (int x = roi.x; x < roi.x + roi.width; x += step) {
-            if (has_mask && det.mask.at<uchar>(y - roi.y, x - roi.x) == 0) continue;
+    // 计算掩码内深度中值作为门控
+    std::vector<double> depths;
+    for (int y = roi.y; y < roi.y + roi.height; y++) {
+        const uint16_t* drow = depth.ptr<uint16_t>(y);
+        const uchar* mrow = has_mask ? det.mask.ptr<uchar>(y - roi.y) : nullptr;
+        for (int x = roi.x; x < roi.x + roi.width; x++) {
+            if (has_mask && mrow[x - roi.x] == 0) continue;
+            uint16_t d = drow[x];
+            if (d > 100 && d < 5000) depths.push_back(d / 1000.0);
+        }
+    }
+    if (depths.empty()) return points;
+    std::nth_element(depths.begin(), depths.begin() + depths.size()/2, depths.end());
+    double median_depth = depths[depths.size()/2];
 
-            uint16_t d = depth.at<uint16_t>(y, x);
+    // 提取点云，并过滤与中值深度差超过阈值的点（背景剔除）
+    for (int y = roi.y; y < roi.y + roi.height; y++) {
+        const uint16_t* drow = depth.ptr<uint16_t>(y);
+        const uchar* mrow = has_mask ? det.mask.ptr<uchar>(y - roi.y) : nullptr;
+        for (int x = roi.x; x < roi.x + roi.width; x++) {
+            if (has_mask && mrow[x - roi.x] == 0) continue;
+            uint16_t d = drow[x];
             if (d > 100 && d < 5000) {
-                double z_m = d / 1000.0;
-                double x_m = (x - config_.cx) * z_m / config_.fx;
-                double y_m = (y - config_.cy) * z_m / config_.fy;
-                points.emplace_back(static_cast<float>(x_m), static_cast<float>(y_m), static_cast<float>(z_m));
+                double z = d / 1000.0;
+                if (std::abs(z - median_depth) > 0.10) continue; // 10cm 门控
+                double x_m = (x - config_.cx) * z / config_.fx;
+                double y_m = (y - config_.cy) * z / config_.fy;
+                points.emplace_back(x_m, y_m, z);
             }
         }
     }
     return points;
 }
 
+std::vector<Eigen::Vector3d> PoseEstimator::voxelDownsample(const std::vector<Eigen::Vector3d>& pts, double leaf) const {
+    if (pts.empty()) return pts;
+    // 简单格网滤波
+    auto [min_x, max_x] = std::minmax_element(pts.begin(), pts.end(),
+        [](const auto& a, const auto& b) { return a.x() < b.x(); });
+    auto [min_y, max_y] = std::minmax_element(pts.begin(), pts.end(),
+        [](const auto& a, const auto& b) { return a.y() < b.y(); });
+    auto [min_z, max_z] = std::minmax_element(pts.begin(), pts.end(),
+        [](const auto& a, const auto& b) { return a.z() < b.z(); });
+    int nx = std::max(1, (int)((max_x->x() - min_x->x())/leaf) + 1);
+    int ny = std::max(1, (int)((max_y->y() - min_y->y())/leaf) + 1);
+    int nz = std::max(1, (int)((max_z->z() - min_z->z())/leaf) + 1);
+    std::vector<std::vector<std::vector<int>>> bins(nx, std::vector<std::vector<int>>(ny, std::vector<int>(nz, -1)));
+    std::vector<Eigen::Vector3d> filtered;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        int gx = std::clamp((int)((pts[i].x() - min_x->x())/leaf), 0, nx-1);
+        int gy = std::clamp((int)((pts[i].y() - min_y->y())/leaf), 0, ny-1);
+        int gz = std::clamp((int)((pts[i].z() - min_z->z())/leaf), 0, nz-1);
+        if (bins[gx][gy][gz] == -1) {
+            bins[gx][gy][gz] = (int)filtered.size();
+            filtered.push_back(pts[i]);
+        }
+    }
+    return filtered;
+}
+
+std::vector<Eigen::Vector3d> PoseEstimator::statisticalOutlierRemoval(const std::vector<Eigen::Vector3d>& pts, int k, double std_mul) const {
+    if (pts.size() < (size_t)k) return pts;
+    // 为每个点计算平均距离
+    std::vector<double> mean_dists(pts.size());
+    // 使用暴力搜索，点数少时可行
+    for (size_t i = 0; i < pts.size(); ++i) {
+        std::vector<double> dists;
+        for (size_t j = 0; j < pts.size(); ++j) {
+            if (i == j) continue;
+            dists.push_back((pts[i] - pts[j]).norm());
+        }
+        std::nth_element(dists.begin(), dists.begin() + k, dists.end());
+        double sum = 0;
+        for (int m = 0; m < k; ++m) sum += dists[m];
+        mean_dists[i] = sum / k;
+    }
+    double sum = 0;
+    for (double d : mean_dists) sum += d;
+    double mean = sum / pts.size();
+    double sq_sum = 0;
+    for (double d : mean_dists) sq_sum += (d - mean) * (d - mean);
+    double stddev = std::sqrt(sq_sum / pts.size());
+    double threshold = mean + std_mul * stddev;
+
+    std::vector<Eigen::Vector3d> inliers;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        if (mean_dists[i] < threshold)
+            inliers.push_back(pts[i]);
+    }
+    return inliers;
+}
+
+std::vector<Eigen::Vector3d> PoseEstimator::euclideanClusterSelect(const std::vector<Eigen::Vector3d>& pts, double tolerance, int min_size) const {
+    auto clusters = euclideanCluster(pts, tolerance, min_size);
+    if (clusters.empty()) return pts;   // 失败时返回原样
+    // 选择点数最多的簇
+    return *std::max_element(clusters.begin(), clusters.end(),
+        [](const auto& a, const auto& b) { return a.size() < b.size(); });
+}
+
+Eigen::Vector3d PoseEstimator::computePCALongAxis(const std::vector<Eigen::Vector3d>& pts, Eigen::Vector3d& centroid) const {
+    centroid = Eigen::Vector3d::Zero();
+    for (auto& p : pts) centroid += p;
+    centroid /= pts.size();
+    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+    for (auto& p : pts) {
+        Eigen::Vector3d d = p - centroid;
+        cov += d * d.transpose();
+    }
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(cov);
+    // 长轴对应最大特征值的特征向量（col(2)）
+    return solver.eigenvectors().col(2).normalized();
+}
+
+std::vector<Eigen::Matrix4d> PoseEstimator::generateInitialCandidates(
+    const Eigen::Vector3d& centroid,
+    const Eigen::Vector3d& long_axis,
+    int num_rolls) const {
+    
+    std::vector<Eigen::Matrix4d> candidates;
+    // 两个极性
+    Eigen::Vector3d axes[2] = {long_axis, -long_axis};
+    for (int p = 0; p < 2; ++p) {
+        // 构建基础旋转：使物体Z轴与 long_axis 对齐
+        Eigen::Matrix3d R_base = Eigen::Quaterniond::FromTwoVectors(Eigen::Vector3d::UnitZ(), axes[p]).toRotationMatrix();
+        // 绕 long_axis 均匀采样 roll 角
+        for (int i = 0; i < num_rolls; ++i) {
+            double roll = 2 * M_PI * i / num_rolls;
+            Eigen::Matrix3d R_roll = Eigen::AngleAxisd(roll, axes[p]) * R_base;
+            Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+            T.block<3,3>(0,0) = R_roll;
+            // 平移初值：模型中心对齐到场景点云质心
+            T.block<3,1>(0,3) = centroid - R_roll * Eigen::Vector3d(0, 0, 0); // 模型中心在物体系原点
+            candidates.push_back(T);
+        }
+    }
+    return candidates;
+}
+
+PoseEstimator::ICPResult PoseEstimator::trimmedICP(
+    const std::vector<Eigen::Vector3d>& source, // 模型点云
+    const std::vector<Eigen::Vector3d>& target, // 场景点云
+    const Eigen::Matrix4d& init_T,
+    double max_dist,
+    int max_iter,
+    double trim_ratio) const {
+
+    // 构建目标点云的k-d树
+    SimpleKDNode* kd_root = buildKDTree(target);
+
+    Eigen::Matrix4d T = init_T;
+    double trimmed_rmse = std::numeric_limits<double>::max();
+    double corr_ratio = 0.0;
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        // 变换源点云
+        std::vector<Eigen::Vector3d> src_transformed(source.size());
+        for (size_t i = 0; i < source.size(); ++i) {
+            Eigen::Vector4d h(source[i].x(), source[i].y(), source[i].z(), 1.0);
+            h = T * h;
+            src_transformed[i] = h.head<3>();
+        }
+
+        // 寻找对应点并计算残差
+        std::vector<std::pair<int, Eigen::Vector3d>> correspondences; // (src_idx, target_pt)
+        std::vector<double> residuals;
+        for (size_t i = 0; i < src_transformed.size(); ++i) {
+            double best_dist = max_dist;
+            Eigen::Vector3d best_pt(0,0,0);
+            nearestNeighbor(kd_root, src_transformed[i], best_dist, best_pt);
+            if (best_dist < max_dist) {
+                correspondences.emplace_back(i, best_pt);
+                residuals.push_back(best_dist);
+            }
+        }
+
+        if (correspondences.size() < 10) break;
+
+        // Trim: 按残差排序，保留前 trim_ratio 比例的点
+        std::vector<int> idx(residuals.size());
+        std::iota(idx.begin(), idx.end(), 0);
+        std::sort(idx.begin(), idx.end(), [&](int a, int b) { return residuals[a] < residuals[b]; });
+        size_t keep_num = std::max((size_t)10, (size_t)(correspondences.size() * trim_ratio));
+        std::vector<Eigen::Vector3d> src_pts, tgt_pts;
+        for (size_t i = 0; i < keep_num; ++i) {
+            int orig = idx[i];
+            src_pts.push_back(src_transformed[correspondences[orig].first]);
+            tgt_pts.push_back(correspondences[orig].second);
+        }
+
+        // 求解最小二乘刚体变换 (SVD)
+        Eigen::Vector3d src_cent(0,0,0), tgt_cent(0,0,0);
+        for (size_t i = 0; i < src_pts.size(); ++i) {
+            src_cent += src_pts[i];
+            tgt_cent += tgt_pts[i];
+        }
+        src_cent /= src_pts.size();
+        tgt_cent /= src_pts.size();
+
+        Eigen::Matrix3d H = Eigen::Matrix3d::Zero();
+        for (size_t i = 0; i < src_pts.size(); ++i) {
+            H += (src_pts[i] - src_cent) * (tgt_pts[i] - tgt_cent).transpose();
+        }
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d R = svd.matrixV() * svd.matrixU().transpose();
+        if (R.determinant() < 0) {
+            Eigen::Matrix3d V = svd.matrixV();
+            V.col(2) *= -1;
+            R = V * svd.matrixU().transpose();
+        }
+        Eigen::Vector3d t = tgt_cent - R * src_cent;
+        Eigen::Matrix4d delta_T = Eigen::Matrix4d::Identity();
+        delta_T.block<3,3>(0,0) = R;
+        delta_T.block<3,1>(0,3) = t;
+
+        T = delta_T * T;
+
+        // 计算本次迭代后 trimmed RMSE
+        double sq_sum = 0;
+        for (size_t i = 0; i < keep_num; ++i) {
+            sq_sum += (R * src_pts[i] + t - tgt_pts[i]).squaredNorm();
+        }
+        trimmed_rmse = std::sqrt(sq_sum / keep_num);
+        corr_ratio = (double)correspondences.size() / source.size();
+    }
+
+    deleteKDTree(kd_root);
+    return {T, trimmed_rmse, corr_ratio};
+}
+
+std::vector<PoseResult> PoseEstimator::estimateMulti(const std::vector<Detection>& detections,
+                                                     const cv::Mat& depth,
+                                                     const cv::Mat& /*color_bgr*/) {
+    std::vector<PoseResult> results;
+
+    struct DetData {
+        Detection det;
+        std::vector<Eigen::Vector3d> cloud;
+        Eigen::Vector3d centroid;
+        Eigen::Matrix4d pose;
+        bool valid = false;
+    };
+    std::vector<DetData> current_dets;
+
+    for (const auto& det : detections) {
+        DetData data;
+        data.det = det;
+
+        // 1. 提取原始点云
+        auto raw = extractPointCloud(det, depth);
+        if (raw.size() < 30) {
+            if(config_.verbose) printf("[Debug] 目标 %d 丢弃: 点云太少 (%zu)\n", det.label, raw.size());
+            continue;
+        }
+
+        // 2. 滤波流水线
+        auto filtered = voxelDownsample(raw, config_.voxel_leaf_size);
+        filtered = statisticalOutlierRemoval(filtered, config_.stat_outlier_k, config_.stat_std_mul);
+        filtered = euclideanClusterSelect(filtered, config_.cluster_tolerance, config_.cluster_min_size);
+        if (filtered.empty()) continue;
+
+        // 3. PCA 求长轴和质心
+        Eigen::Vector3d centroid;
+        Eigen::Vector3d long_axis = computePCALongAxis(filtered, centroid);
+
+        // ========== 关键修改1：根据大头小头特征固定轴线方向 ==========
+        {
+            std::vector<double> projs;
+            projs.reserve(filtered.size());
+            for (const auto& p : filtered) {
+                projs.push_back((p - centroid).dot(long_axis));
+            }
+            std::nth_element(projs.begin(), projs.begin() + projs.size()/2, projs.end());
+            double median_proj = projs[projs.size()/2];
+
+            std::vector<double> radii_pos, radii_neg;
+            for (const auto& p : filtered) {
+                double d_axis = (p - centroid).cross(long_axis).norm();
+                double proj = (p - centroid).dot(long_axis);
+                if (proj > median_proj) {
+                    radii_pos.push_back(d_axis);
+                } else {
+                    radii_neg.push_back(d_axis);
+                }
+            }
+
+            double avg_r_pos = 0, avg_r_neg = 0;
+            if (!radii_pos.empty()) avg_r_pos = std::accumulate(radii_pos.begin(), radii_pos.end(), 0.0) / radii_pos.size();
+            if (!radii_neg.empty()) avg_r_neg = std::accumulate(radii_neg.begin(), radii_neg.end(), 0.0) / radii_neg.size();
+
+            if (avg_r_pos > avg_r_neg) {
+                long_axis = -long_axis;   // 让 +Z 指向小头（底部）
+            }
+        }
+
+        // 4. 候选生成
+        auto candidates = generateInitialCandidates(centroid, long_axis, config_.num_roll_candidates);
+
+        // ========== 关键修改2：利用投影 y 坐标过滤候选 ==========
+        const double half_height = config_.cylinder_height / 2.0;
+        const Eigen::Vector3d top_local(0, 0, half_height);
+        const Eigen::Vector3d bot_local(0, 0, -half_height);
+        std::vector<Eigen::Matrix4d> valid_candidates;
+
+        for (const auto& T : candidates) {
+            Eigen::Vector4d top_cam = T * Eigen::Vector4d(top_local.x(), top_local.y(), top_local.z(), 1.0);
+            Eigen::Vector4d bot_cam = T * Eigen::Vector4d(bot_local.x(), bot_local.y(), bot_local.z(), 1.0);
+            
+            double v_top = (top_cam.y() * config_.fy / top_cam.z()) + config_.cy;
+            double v_bot = (bot_cam.y() * config_.fy / bot_cam.z()) + config_.cy;
+            
+            if (v_top < v_bot) {
+                valid_candidates.push_back(T);
+            }
+        }
+
+        if (valid_candidates.empty()) {
+            valid_candidates = candidates;
+        }
+
+        // 5. ICP 评估并选出最佳候选
+        ICPResult best_res;
+        best_res.trimmed_rmse = std::numeric_limits<double>::max();
+        for (const auto& init : valid_candidates) {
+            auto res = trimmedICP(model_cloud_, filtered, init,
+                                  config_.icp_max_correspondence_dist,
+                                  config_.icp_max_iter,
+                                  config_.trimmed_ratio);
+            if (res.trimmed_rmse < best_res.trimmed_rmse) {
+                best_res = res;
+            }
+        }
+
+        if (best_res.trimmed_rmse > 0.1 || best_res.correspondence_ratio < 0.3) {
+            if(config_.verbose) printf("[Debug] 目标 %d ICP 失败: rmse=%.3f ratio=%.2f\n",
+                                       det.label, best_res.trimmed_rmse, best_res.correspondence_ratio);
+            continue;
+        }
+
+        data.valid = true;
+        data.pose = best_res.T;
+        data.centroid = centroid;
+        current_dets.push_back(data);
+    }
+
+    // ========== 输出结果（基于表面法向锁定局部坐标系） ==========
+    for (size_t i = 0; i < current_dets.size(); ++i) {
+        PoseResult res;
+        Eigen::Matrix3d R = current_dets[i].pose.block<3,3>(0,0);
+        
+        // 1. Z 轴：保持 ICP 算出来的完美中轴线 (蓝线，顺着长边)
+        Eigen::Vector3d z_axis = R.col(2).normalized(); 
+        
+        // 2. 核心锚点：算出从圆柱中心(pose) 指向 表面质心(centroid) 的向量
+        Eigen::Vector3d center_to_surface = current_dets[i].centroid - current_dets[i].pose.block<3,1>(0,3);
+        
+        // 3. X 轴：强制让 X 轴指向这个表面法向 (红线，垂直于表面指出来)
+        Eigen::Vector3d x_axis = center_to_surface - z_axis * (z_axis.dot(center_to_surface));
+        x_axis.normalize();
+        
+        // 4. Y 轴：利用右手定则自动生成切向轴 (绿线，顺着装甲板的短边贴着)
+        Eigen::Vector3d y_axis = z_axis.cross(x_axis).normalized();
+
+        // 重新组装完美焊死的旋转矩阵
+        Eigen::Matrix3d R_fixed;
+        R_fixed.col(0) = x_axis; // 红线：戳出表面
+        R_fixed.col(1) = y_axis; // 绿线：贴着表面切向
+        R_fixed.col(2) = z_axis; // 蓝线：顺着扇叶长边
+        
+        if (R_fixed.determinant() < 0) {
+            R_fixed.col(1) = -R_fixed.col(1); // 防止右手系翻转
+        }
+
+        res.T_cam_obj = current_dets[i].pose;
+        res.T_cam_obj.block<3,3>(0,0) = R_fixed;      // 替换为锁死自转的旋转矩阵
+        res.translation = current_dets[i].pose.block<3,1>(0,3);
+        res.quaternion = Eigen::Quaterniond(R_fixed);
+        res.axis_direction = z_axis;             
+        res.euler_angles = R_fixed.eulerAngles(2,1,0) * 180.0 / M_PI;
+        res.label = current_dets[i].det.label;
+        res.valid = true;
+        results.push_back(res);
+    }
+
+    return results;
+}
+
+
 void PoseEstimator::drawPoseAxes(cv::Mat& image, const PoseResult& pose, double axis_length) const {
     if (!pose.valid) return;
 
+    // 获取真实的圆柱物理半高 (例如 150mm / 2 = 75mm)
+    double h_half = config_.cylinder_height / 2.0;
+
     std::vector<cv::Point3f> axis_pts_3d = {
-        cv::Point3f(0, 0, 0), cv::Point3f(axis_length, 0, 0),
-        cv::Point3f(0, axis_length, 0), cv::Point3f(0, 0, axis_length)
+        cv::Point3f(0, 0, 0),                           // 0: 质心原点
+        cv::Point3f(axis_length, 0, 0),                 // 1: X 轴正向
+        cv::Point3f(0, axis_length, 0),                 // 2: Y 轴正向
+        cv::Point3f(0, 0, axis_length),                 // 3: Z 轴正向
+        cv::Point3f(0, 0, -h_half),                     // 4: 真实的圆柱【底面】中心点
+        cv::Point3f(0, 0, h_half)                       // 5: 真实的圆柱【顶面】中心点
     };
 
     cv::Mat rvec, tvec;
@@ -296,33 +570,35 @@ void PoseEstimator::drawPoseAxes(cv::Mat& image, const PoseResult& pose, double 
 
     tvec = (cv::Mat_<double>(3, 1) << pose.translation.x(), pose.translation.y(), pose.translation.z());
 
+    // 3D 到 2D 图像重投影
     std::vector<cv::Point2f> img_pts;
     cv::projectPoints(axis_pts_3d, rvec, tvec, camera_matrix_, dist_coeffs_, img_pts);
 
-    cv::circle(image, img_pts[0], 5, cv::Scalar(255, 255, 255), -1);
-    cv::arrowedLine(image, img_pts[0], img_pts[1], cv::Scalar(0, 0, 255), 2);
-    cv::arrowedLine(image, img_pts[0], img_pts[2], cv::Scalar(0, 255, 0), 2);
-    cv::arrowedLine(image, img_pts[0], img_pts[3], cv::Scalar(255, 0, 0), 2);
-}
+    // ==========================================
+    // 1. 画真实的物理圆柱中轴线 (黄色，带两端端点)
+    // ==========================================
+    cv::line(image, img_pts[4], img_pts[5], cv::Scalar(0, 255, 255), 3, cv::LINE_AA); // 黄色粗线
+    cv::circle(image, img_pts[4], 5, cv::Scalar(0, 255, 255), -1); // 底端圆点
+    cv::circle(image, img_pts[5], 5, cv::Scalar(0, 255, 255), -1); // 顶端圆点
+    
+    // 标注一下中轴线的头尾
+    cv::putText(image, "Top", img_pts[5] + cv::Point2f(5, -5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 2);
+    cv::putText(image, "Bot", img_pts[4] + cv::Point2f(5, 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 2);
 
-void PoseEstimator::resetTrackingSlot(int slot_id) {
-    if (slot_id < 0 || slot_id >= (int)slots_.size()) return;
+    // ==========================================
+    // 2. 画原点和标准的 XYZ 坐标系
+    // ==========================================
+    cv::circle(image, img_pts[0], 4, cv::Scalar(255, 255, 255), -1); // 质心原点
+    
+    cv::arrowedLine(image, img_pts[0], img_pts[1], cv::Scalar(0, 0, 255), 2); // X 轴 (红)
+    cv::arrowedLine(image, img_pts[0], img_pts[2], cv::Scalar(0, 255, 0), 2); // Y 轴 (绿)
+    // Z 轴 (蓝) 盖在中轴线上，稍微细一点，体现方向
+    cv::arrowedLine(image, img_pts[0], img_pts[3], cv::Scalar(255, 0, 0), 2); 
 
-    auto& slot = slots_[slot_id];
-    slot.active = false;
-    slot.loss_counter = 0;
-
-    m3t::Transform3fA clean_pose = m3t::Transform3fA::Identity();
-    clean_pose.translation() = Eigen::Vector3f(0.0f, 0.0f, 10.0f);
-    slot.body->set_body2world_pose(clean_pose);
-    slot.link->set_link2world_pose(clean_pose);
-}
-
-void PoseEstimator::resetAllTracking() {
-    for (int i = 0; i < (int)slots_.size(); ++i) {
-        resetTrackingSlot(i);
-    }
-    if (tracker_) tracker_->SetUp();
+    // 标注 XYZ 字母
+    cv::putText(image, "X", img_pts[1], cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 255), 2);
+    cv::putText(image, "Y", img_pts[2], cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+    cv::putText(image, "Z", img_pts[3], cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 0), 2);
 }
 
 }  // namespace energy_unit
