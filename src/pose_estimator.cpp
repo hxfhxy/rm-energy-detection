@@ -503,39 +503,29 @@ std::vector<PoseResult> PoseEstimator::estimateMulti(const std::vector<Detection
         current_dets.push_back(data);
     }
 
-    // ========== 输出结果（基于表面法向锁定局部坐标系） ==========
+    // ========== 输出结果（新增 XY 轴固定） ==========
     for (size_t i = 0; i < current_dets.size(); ++i) {
         PoseResult res;
+        // 固定绕轴转角：强制 X 轴水平向右，Y 轴由右手定则确定
         Eigen::Matrix3d R = current_dets[i].pose.block<3,3>(0,0);
-        
-        // 1. Z 轴：保持 ICP 算出来的完美中轴线 (蓝线，顺着长边)
-        Eigen::Vector3d z_axis = R.col(2).normalized(); 
-        
-        // 2. 核心锚点：算出从圆柱中心(pose) 指向 表面质心(centroid) 的向量
-        Eigen::Vector3d center_to_surface = current_dets[i].centroid - current_dets[i].pose.block<3,1>(0,3);
-        
-        // 3. X 轴：强制让 X 轴指向这个表面法向 (红线，垂直于表面指出来)
-        Eigen::Vector3d x_axis = center_to_surface - z_axis * (z_axis.dot(center_to_surface));
+        Eigen::Vector3d z_axis = R.col(2).normalized();                     // 保持 Z 轴不变
+        Eigen::Vector3d x_axis = Eigen::Vector3d::UnitX() - z_axis * (z_axis.dot(Eigen::Vector3d::UnitX()));
+        if (x_axis.norm() < 1e-6) {
+            x_axis = Eigen::Vector3d::UnitY() - z_axis * (z_axis.dot(Eigen::Vector3d::UnitY()));
+        }
         x_axis.normalize();
-        
-        // 4. Y 轴：利用右手定则自动生成切向轴 (绿线，顺着装甲板的短边贴着)
         Eigen::Vector3d y_axis = z_axis.cross(x_axis).normalized();
 
-        // 重新组装完美焊死的旋转矩阵
         Eigen::Matrix3d R_fixed;
-        R_fixed.col(0) = x_axis; // 红线：戳出表面
-        R_fixed.col(1) = y_axis; // 绿线：贴着表面切向
-        R_fixed.col(2) = z_axis; // 蓝线：顺着扇叶长边
-        
-        if (R_fixed.determinant() < 0) {
-            R_fixed.col(1) = -R_fixed.col(1); // 防止右手系翻转
-        }
+        R_fixed.col(0) = x_axis;
+        R_fixed.col(1) = y_axis;
+        R_fixed.col(2) = z_axis;
 
         res.T_cam_obj = current_dets[i].pose;
-        res.T_cam_obj.block<3,3>(0,0) = R_fixed;      // 替换为锁死自转的旋转矩阵
+        res.T_cam_obj.block<3,3>(0,0) = R_fixed;      // 替换旋转部分
         res.translation = current_dets[i].pose.block<3,1>(0,3);
         res.quaternion = Eigen::Quaterniond(R_fixed);
-        res.axis_direction = z_axis;             
+        res.axis_direction = z_axis;
         res.euler_angles = R_fixed.eulerAngles(2,1,0) * 180.0 / M_PI;
         res.label = current_dets[i].det.label;
         res.valid = true;
